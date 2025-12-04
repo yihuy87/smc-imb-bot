@@ -36,7 +36,7 @@ IMB_ENTRY_TF = "5m"
 IMB_USE_HTF_FILTER = os.getenv("IMB_USE_HTF_FILTER", "true").lower() == "true"
 
 # Usia maksimal setup IMB (berapa candle 5m sejak impuls)
-IMB_MAX_ENTRY_AGE_CANDLES = int(os.getenv("IMB_MAX_ENTRY_AGE_CANDLES", "8"))
+IMB_MAX_ENTRY_AGE_CANDLES = int(os.getenv("IMB_MAX_ENTRY_AGE_CANDLES", "6"))
 
 # Minimal RR ke TP2 (misal 1.8 berarti TP2 minimal 1:1.8)
 IMB_MIN_RR_TP2 = float(os.getenv("IMB_MIN_RR_TP2", "1.8"))
