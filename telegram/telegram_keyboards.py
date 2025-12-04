@@ -47,4 +47,4 @@ def get_admin_reply_keyboard() -> dict:
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
-    }
+                }
