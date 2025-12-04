@@ -103,14 +103,13 @@ def _build_levels(
 ) -> Dict[str, float]:
     """
     Bangun Entry/SL/TP dengan gaya mirip bot 1:
-    - Entry tetap berbasis blok IMB (low/high blok)
-    - SL = ekstrem blok ± buffer dinamis (bukan fixed %)
+    - Entry di level blok IMB (low/high blok)
+    - SL = ekstrem blok ± buffer dinamis
     - TP = kelipatan R (RR1 / RR2 / RR3)
     """
     if side == "long":
-        # Entry di dekat low blok, tapi jangan di atas harga terakhir (anti FOMO)
-        raw_entry = block_low
-        entry = min(raw_entry, last_price)
+        # Entry di low blok (limit order di blok)
+        entry = block_low
 
         sl_base = block_low
         buffer = max(sl_base * 0.0015, abs(entry) * 0.0005)
@@ -118,9 +117,8 @@ def _build_levels(
 
         risk = entry - sl
     else:
-        # SHORT
-        raw_entry = block_high
-        entry = max(raw_entry, last_price)
+        # SHORT → entry di high blok
+        entry = block_high
 
         sl_base = block_high
         buffer = max(sl_base * 0.0015, abs(entry) * 0.0005)
@@ -128,9 +126,9 @@ def _build_levels(
 
         risk = sl - entry
 
+    # kalau tetap aneh, buang saja setup
     if risk <= 0:
-        # fallback kecil
-        risk = abs(entry) * 0.003
+        return {}
 
     # TP berdasarkan RR
     if side == "long":
@@ -155,7 +153,6 @@ def _build_levels(
         "lev_min": float(lev_min),
         "lev_max": float(lev_max),
     }
-
 
 def recommend_leverage_range(sl_pct: float) -> Tuple[float, float]:
     """
@@ -203,7 +200,9 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     last_price = candles_5m[-1]["close"]
 
     levels = _build_levels(side, block_low, block_high, last_price)
-
+    if not levels:
+        return None
+    
     entry = levels["entry"]
     sl = levels["sl"]
     tp1 = levels["tp1"]
