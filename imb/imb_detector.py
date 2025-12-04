@@ -104,7 +104,7 @@ def _build_levels(
     """
     Bangun Entry/SL/TP dengan gaya mirip bot 1:
     - Entry tetap berbasis blok IMB (low/high blok)
-    - SL = ekstrem blok ± buffer dinamis, tapi tetap di sisi yang benar
+    - SL = ekstrem blok ± buffer dinamis (bukan fixed %)
     - TP = kelipatan R (RR1 / RR2 / RR3)
     """
     if side == "long":
@@ -112,8 +112,7 @@ def _build_levels(
         raw_entry = block_low
         entry = min(raw_entry, last_price)
 
-        # pastikan basis SL tidak di atas entry
-        sl_base = min(block_low, entry)
+        sl_base = block_low
         buffer = max(sl_base * 0.0015, abs(entry) * 0.0005)
         sl = sl_base - buffer
 
@@ -123,20 +122,15 @@ def _build_levels(
         raw_entry = block_high
         entry = max(raw_entry, last_price)
 
-        # pastikan basis SL tidak di bawah entry
-        sl_base = max(block_high, entry)
+        sl_base = block_high
         buffer = max(sl_base * 0.0015, abs(entry) * 0.0005)
         sl = sl_base + buffer
 
         risk = sl - entry
 
     if risk <= 0:
-        # fallback kecil agar tetap ada jarak yang masuk akal
+        # fallback kecil
         risk = abs(entry) * 0.003
-        if side == "long":
-            sl = entry - risk
-        else:
-            sl = entry + risk
 
     # TP berdasarkan RR
     if side == "long":
@@ -160,8 +154,7 @@ def _build_levels(
         "sl_pct": float(sl_pct),
         "lev_min": float(lev_min),
         "lev_max": float(lev_max),
-            }
-
+    }
 
 
 def recommend_leverage_range(sl_pct: float) -> Tuple[float, float]:
@@ -192,7 +185,7 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     - temukan blok IMB sebelum impuls
     - bangun Entry/SL/TP berdasarkan blok
     - cek RR & SL%
-    - cek konteks HTF
+    - cek konteks HTF (kalau diaktifkan)
     - skor & tier → hanya kirim jika >= min_tier
     """
     if len(candles_5m) < 40:
@@ -226,12 +219,22 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     min_rr = imb_settings.min_rr_tp2
     rr_ok = rr_tp2 >= min_rr
 
-    # konteks HTF
-    htf_ctx = get_htf_context(symbol)
-    if side == "long":
-        htf_alignment = bool(htf_ctx.get("htf_ok_long", True))
+    # konteks HTF (respect IMB_USE_HTF_FILTER)
+    if imb_settings.use_htf_filter:
+        htf_ctx = get_htf_context(symbol)
+        if side == "long":
+            htf_alignment = bool(htf_ctx.get("htf_ok_long", True))
+        else:
+            htf_alignment = bool(htf_ctx.get("htf_ok_short", True))
     else:
-        htf_alignment = bool(htf_ctx.get("htf_ok_short", True))
+        htf_ctx = {
+            "trend_1h": "RANGE",
+            "pos_1h": "MID",
+            "pos_15m": "MID",
+            "htf_ok_long": True,
+            "htf_ok_short": True,
+        }
+        htf_alignment = True
 
     # meta untuk skoring
     meta = {
@@ -259,7 +262,7 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     lev_text = f"{lev_min:.0f}x–{lev_max:.0f}x"
     sl_pct_text = f"{sl_pct:.2f}%"
 
-    # validitas sinyal (misal 8 candle 5m = 40 menit, ambil dari imb_settings)
+    # validitas sinyal: ambil dari IMB_MAX_ENTRY_AGE_CANDLES (5m per candle)
     max_age_candles = imb_settings.max_entry_age_candles
     approx_minutes = max_age_candles * 5
     valid_text = f"±{approx_minutes} menit" if approx_minutes > 0 else "singkat"
@@ -307,4 +310,4 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
         "score": score,
         "htf_context": htf_ctx,
         "message": text,
-    }
+        }
