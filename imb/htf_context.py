@@ -4,10 +4,17 @@
 # - posisi harga di dalam range (DISCOUNT / PREMIUM / MID) untuk 1h & 15m
 
 from typing import Dict, List, Literal, Optional
+import time
+
 import numpy as np
 import requests
 
 from config import BINANCE_REST_URL
+
+
+# Cache HTF per symbol (biar tidak spam REST ke Binance)
+HTF_CACHE_TTL = 120  # detik
+_htf_cache: Dict[str, Dict[str, object]] = {}
 
 
 def _fetch_klines(symbol: str, interval: str, limit: int = 150) -> Optional[List[dict]]:
@@ -21,10 +28,6 @@ def _fetch_klines(symbol: str, interval: str, limit: int = 150) -> Optional[List
         print(f"[{symbol}] ERROR fetch HTF klines ({interval}):", e)
         return None
 
-
-# ==============================
-# Optimized: convert OHLC to NumPy arrays
-# ==============================
 
 def _parse_ohlc(data: List[dict]) -> Dict[str, np.ndarray]:
     highs = []
@@ -45,10 +48,6 @@ def _parse_ohlc(data: List[dict]) -> Dict[str, np.ndarray]:
         "close": np.asarray(closes, dtype=float),
     }
 
-
-# ==============================
-# Optimized trend detection
-# ==============================
 
 def _detect_trend_1h(hlc: Dict[str, np.ndarray]) -> Literal["UP", "DOWN", "RANGE"]:
     highs = hlc["high"]
@@ -79,10 +78,6 @@ def _detect_trend_1h(hlc: Dict[str, np.ndarray]) -> Literal["UP", "DOWN", "RANGE
 
     return "RANGE"
 
-
-# ==============================
-# Optimized: DISCOUNT / PREMIUM detection
-# ==============================
 
 def _discount_premium(
     hlc: Dict[str, np.ndarray],
@@ -135,12 +130,24 @@ def _discount_premium(
     }
 
 
-# ==============================
-# Main function — unchanged structure
-# ==============================
-
 def get_htf_context(symbol: str) -> Dict[str, object]:
-    ctx = {
+    """
+    Ambil konteks 1h & 15m untuk symbol (tanpa indikator klasik),
+    dengan caching per symbol supaya tidak spam REST.
+    """
+    symbol_u = symbol.upper()
+    now = time.time()
+
+    # Cek cache dulu
+    cached = _htf_cache.get(symbol_u)
+    if cached:
+        ts = cached.get("ts", 0.0)
+        ctx_cached = cached.get("ctx")
+        if ctx_cached is not None and (now - ts) < HTF_CACHE_TTL:
+            return ctx_cached  # langsung pakai cached context
+
+    # Default context (NETRAL)
+    ctx_default = {
         "trend_1h": "RANGE",
         "pos_1h": "MID",
         "pos_15m": "MID",
@@ -148,11 +155,13 @@ def get_htf_context(symbol: str) -> Dict[str, object]:
         "htf_ok_short": True,
     }
 
-    data_1h = _fetch_klines(symbol, "1h", 150)
-    data_15m = _fetch_klines(symbol, "15m", 150)
+    data_1h = _fetch_klines(symbol_u, "1h", 150)
+    data_15m = _fetch_klines(symbol_u, "15m", 150)
 
     if not data_1h or not data_15m:
-        return ctx
+        # Cache juga default supaya tidak spam request saat error
+        _htf_cache[symbol_u] = {"ts": now, "ctx": ctx_default}
+        return ctx_default
 
     hlc_1h = _parse_ohlc(data_1h)
     hlc_15m = _parse_ohlc(data_15m)
@@ -164,6 +173,9 @@ def get_htf_context(symbol: str) -> Dict[str, object]:
     pos_1h = pos1["position"]
     pos_15m = pos15["position"]
 
+    # aturan sederhana:
+    # LONG ideal: 1h bukan DOWN kuat + 1h & 15m bukan PREMIUM
+    # SHORT ideal: 1h bukan UP kuat + 1h & 15m bukan DISCOUNT
     htf_ok_long = not (trend_1h == "DOWN" and pos_1h == "PREMIUM")
     if pos_1h == "PREMIUM" and pos_15m == "PREMIUM":
         htf_ok_long = False
@@ -172,10 +184,14 @@ def get_htf_context(symbol: str) -> Dict[str, object]:
     if pos_1h == "DISCOUNT" and pos_15m == "DISCOUNT":
         htf_ok_short = False
 
-    return {
+    ctx_final = {
         "trend_1h": trend_1h,
         "pos_1h": pos_1h,
         "pos_15m": pos_15m,
         "htf_ok_long": htf_ok_long,
         "htf_ok_short": htf_ok_short,
-                         }
+    }
+
+    # Simpan ke cache
+    _htf_cache[symbol_u] = {"ts": now, "ctx": ctx_final}
+    return ctx_final
