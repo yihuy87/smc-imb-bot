@@ -1,10 +1,7 @@
 # imb/htf_context.py
-# Ambil konteks HTF (15m & 1h) sederhana tanpa indikator:
+# Ambil konteks HTF (15m & 1h) dengan cache:
 # - trend UP / DOWN / RANGE di 1h
 # - posisi harga di dalam range (DISCOUNT / PREMIUM / MID) untuk 1h & 15m
-# Sekarang pakai caching per-symbol & per-timeframe:
-#   - 1h  : TTL 3600 detik
-#   - 15m : TTL 900 detik
 
 from typing import Dict, List, Literal, Optional
 import time
@@ -12,55 +9,32 @@ import time
 import requests
 
 from config import BINANCE_REST_URL
+from core.imb_settings import imb_settings
 
-# Cache HTF: key = "SYMBOL_INTERVAL" (contoh: "BTCUSDT_1h")
-# value = {"ts": float, "data": List[dict]}
+
+# ====== CONFIG CACHE ======
+TTL_1H = 3600      # 1 jam
+TTL_15M = 900      # 15 menit
+
+# Struktur cache per symbol:
+# {
+#   "ctx": {...},
+#   "ts_1h": float (epoch),
+#   "ts_15m": float (epoch)
+# }
 _HTF_CACHE: Dict[str, Dict[str, object]] = {}
 
 
-def _fetch_klines(
-    symbol: str,
-    interval: str,
-    limit: int = 150,
-    ttl_seconds: Optional[int] = None,
-) -> Optional[List[dict]]:
-    """
-    Fetch klines dari Binance dengan optional cache TTL per symbol+interval.
-
-    ttl_seconds:
-      - None atau 0  → selalu fetch baru (tanpa cache)
-      - > 0          → pakai cache jika belum lewat TTL
-    """
-    sym_u = symbol.upper()
-    cache_key = f"{sym_u}_{interval}"
-
-    # Cek cache
-    if ttl_seconds and ttl_seconds > 0:
-        cached = _HTF_CACHE.get(cache_key)
-        if cached:
-            ts = cached.get("ts", 0.0)
-            if time.time() - ts < ttl_seconds:
-                data = cached.get("data")
-                if isinstance(data, list) and data:
-                    return data  # pakai data cache
-
+def _fetch_klines(symbol: str, interval: str, limit: int = 150) -> Optional[List[dict]]:
     url = f"{BINANCE_REST_URL}/fapi/v1/klines"
-    params = {"symbol": sym_u, "interval": interval, "limit": limit}
+    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
     try:
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
-
-        # Simpan ke cache kalau TTL dipakai
-        if ttl_seconds and ttl_seconds > 0 and isinstance(data, list) and data:
-            _HTF_CACHE[cache_key] = {
-                "ts": time.time(),
-                "data": data,
-            }
-
         return data
     except Exception as e:
-        print(f"[{sym_u}] ERROR fetch HTF klines ({interval}):", e)
+        print(f"[{symbol}] ERROR fetch HTF klines ({interval}):", e)
         return None
 
 
@@ -156,24 +130,8 @@ def _discount_premium(
     }
 
 
-def get_htf_context(symbol: str) -> Dict[str, object]:
-    """
-    Ambil konteks 1h & 15m untuk symbol (tanpa indikator klasik).
-    Return dict:
-
-    {
-      "trend_1h": "UP"|"DOWN"|"RANGE",
-      "pos_1h": "DISCOUNT"|"PREMIUM"|"MID",
-      "pos_15m": "DISCOUNT"|"PREMIUM"|"MID",
-      "htf_ok_long": bool,
-      "htf_ok_short": bool,
-    }
-
-    Jika gagal fetch data, semua dianggap NETRAL (htf_ok_long/short = True).
-    """
-
-    # default netral
-    ctx = {
+def _neutral_ctx() -> Dict[str, object]:
+    return {
         "trend_1h": "RANGE",
         "pos_1h": "MID",
         "pos_15m": "MID",
@@ -181,28 +139,60 @@ def get_htf_context(symbol: str) -> Dict[str, object]:
         "htf_ok_short": True,
     }
 
-    # TTL berbeda:
-    # - 1h  : 3600 detik
-    # - 15m : 900 detik
-    data_1h = _fetch_klines(symbol, "1h", 150, ttl_seconds=3600)
-    data_15m = _fetch_klines(symbol, "15m", 150, ttl_seconds=900)
 
-    if not data_1h or not data_15m:
-        return ctx  # tetap netral kalau gagal
+def get_htf_context(symbol: str) -> Dict[str, object]:
+    """
+    Versi cached:
+    - Kalau IMB_USE_HTF_FILTER = false → langsung netral (tidak pakai HTF)
+    - Kalau true → pakai cache per symbol, refresh:
+        - 1h setiap ≥ 1 jam
+        - 15m setiap ≥ 15 menit
+    """
+    # kalau HTF filter dimatikan di config → selalu netral, tanpa REST call
+    if not imb_settings.use_htf_filter:
+        return _neutral_ctx()
 
-    hlc_1h = _parse_ohlc(data_1h)
-    hlc_15m = _parse_ohlc(data_15m)
+    now = time.time()
+    sym = symbol.upper()
 
-    trend_1h = _detect_trend_1h(hlc_1h)
-    pos1 = _discount_premium(hlc_1h)
-    pos15 = _discount_premium(hlc_15m)
+    cache = _HTF_CACHE.get(sym)
+    if cache is None:
+        cache = {
+            "ctx": _neutral_ctx(),
+            "ts_1h": 0.0,
+            "ts_15m": 0.0,
+        }
+        _HTF_CACHE[sym] = cache
 
-    pos_1h = pos1["position"]
-    pos_15m = pos15["position"]
+    ctx = cache["ctx"]
+    ts_1h = float(cache.get("ts_1h", 0.0))
+    ts_15m = float(cache.get("ts_15m", 0.0))
 
-    # aturan sederhana:
-    # LONG ideal: 1h bukan DOWN kuat + 1h & 15m bukan PREMIUM
-    # SHORT ideal: 1h bukan UP kuat + 1h & 15m bukan DISCOUNT
+    trend_1h = ctx.get("trend_1h", "RANGE")
+    pos_1h = ctx.get("pos_1h", "MID")
+    pos_15m = ctx.get("pos_15m", "MID")
+
+    # --- UPDATE 1H JIKA PERLU ---
+    if now - ts_1h >= TTL_1H or ts_1h == 0.0:
+        data_1h = _fetch_klines(sym, "1h", 150)
+        if data_1h:
+            hlc_1h = _parse_ohlc(data_1h)
+            trend_1h = _detect_trend_1h(hlc_1h)
+            pos1 = _discount_premium(hlc_1h)
+            pos_1h = pos1["position"]
+            ts_1h = now  # update timestamp hanya kalau berhasil
+
+    # --- UPDATE 15M JIKA PERLU ---
+    if now - ts_15m >= TTL_15M or ts_15m == 0.0:
+        data_15m = _fetch_klines(sym, "15m", 150)
+        if data_15m:
+            hlc_15m = _parse_ohlc(data_15m)
+            pos15 = _discount_premium(hlc_15m)
+            pos_15m = pos15["position"]
+            ts_15m = now
+
+    # kalau dua-duanya gagal fetch → pakai nilai lama di ctx (atau netral awal)
+    # bangun rule align
     htf_ok_long = not (trend_1h == "DOWN" and pos_1h == "PREMIUM")
     if pos_1h == "PREMIUM" and pos_15m == "PREMIUM":
         htf_ok_long = False
@@ -211,10 +201,16 @@ def get_htf_context(symbol: str) -> Dict[str, object]:
     if pos_1h == "DISCOUNT" and pos_15m == "DISCOUNT":
         htf_ok_short = False
 
-    return {
+    new_ctx = {
         "trend_1h": trend_1h,
         "pos_1h": pos_1h,
         "pos_15m": pos_15m,
         "htf_ok_long": htf_ok_long,
         "htf_ok_short": htf_ok_short,
-        }
+    }
+
+    cache["ctx"] = new_ctx
+    cache["ts_1h"] = ts_1h
+    cache["ts_15m"] = ts_15m
+
+    return new_ctx
