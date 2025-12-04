@@ -2,24 +2,65 @@
 # Ambil konteks HTF (15m & 1h) sederhana tanpa indikator:
 # - trend UP / DOWN / RANGE di 1h
 # - posisi harga di dalam range (DISCOUNT / PREMIUM / MID) untuk 1h & 15m
+# Sekarang pakai caching per-symbol & per-timeframe:
+#   - 1h  : TTL 3600 detik
+#   - 15m : TTL 900 detik
 
 from typing import Dict, List, Literal, Optional
+import time
 
 import requests
 
 from config import BINANCE_REST_URL
 
+# Cache HTF: key = "SYMBOL_INTERVAL" (contoh: "BTCUSDT_1h")
+# value = {"ts": float, "data": List[dict]}
+_HTF_CACHE: Dict[str, Dict[str, object]] = {}
 
-def _fetch_klines(symbol: str, interval: str, limit: int = 150) -> Optional[List[dict]]:
+
+def _fetch_klines(
+    symbol: str,
+    interval: str,
+    limit: int = 150,
+    ttl_seconds: Optional[int] = None,
+) -> Optional[List[dict]]:
+    """
+    Fetch klines dari Binance dengan optional cache TTL per symbol+interval.
+
+    ttl_seconds:
+      - None atau 0  → selalu fetch baru (tanpa cache)
+      - > 0          → pakai cache jika belum lewat TTL
+    """
+    sym_u = symbol.upper()
+    cache_key = f"{sym_u}_{interval}"
+
+    # Cek cache
+    if ttl_seconds and ttl_seconds > 0:
+        cached = _HTF_CACHE.get(cache_key)
+        if cached:
+            ts = cached.get("ts", 0.0)
+            if time.time() - ts < ttl_seconds:
+                data = cached.get("data")
+                if isinstance(data, list) and data:
+                    return data  # pakai data cache
+
     url = f"{BINANCE_REST_URL}/fapi/v1/klines"
-    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+    params = {"symbol": sym_u, "interval": interval, "limit": limit}
     try:
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
+
+        # Simpan ke cache kalau TTL dipakai
+        if ttl_seconds and ttl_seconds > 0 and isinstance(data, list) and data:
+            _HTF_CACHE[cache_key] = {
+                "ts": time.time(),
+                "data": data,
+            }
+
         return data
     except Exception as e:
-        print(f"[{symbol}] ERROR fetch HTF klines ({interval}):", e)
+        print(f"[{sym_u}] ERROR fetch HTF klines ({interval}):", e)
         return None
 
 
@@ -130,6 +171,8 @@ def get_htf_context(symbol: str) -> Dict[str, object]:
 
     Jika gagal fetch data, semua dianggap NETRAL (htf_ok_long/short = True).
     """
+
+    # default netral
     ctx = {
         "trend_1h": "RANGE",
         "pos_1h": "MID",
@@ -138,11 +181,14 @@ def get_htf_context(symbol: str) -> Dict[str, object]:
         "htf_ok_short": True,
     }
 
-    data_1h = _fetch_klines(symbol, "1h", 150)
-    data_15m = _fetch_klines(symbol, "15m", 150)
+    # TTL berbeda:
+    # - 1h  : 3600 detik
+    # - 15m : 900 detik
+    data_1h = _fetch_klines(symbol, "1h", 150, ttl_seconds=3600)
+    data_15m = _fetch_klines(symbol, "15m", 150, ttl_seconds=900)
 
     if not data_1h or not data_15m:
-        return ctx
+        return ctx  # tetap netral kalau gagal
 
     hlc_1h = _parse_ohlc(data_1h)
     hlc_15m = _parse_ohlc(data_15m)
@@ -171,4 +217,4 @@ def get_htf_context(symbol: str) -> Dict[str, object]:
         "pos_15m": pos_15m,
         "htf_ok_long": htf_ok_long,
         "htf_ok_short": htf_ok_short,
-    }
+        }
