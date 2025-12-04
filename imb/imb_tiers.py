@@ -17,7 +17,6 @@ def score_signal(meta: Dict) -> int:
     - SL% sehat
     - align dengan konteks HTF
     """
-
     score = 0
 
     has_block = bool(meta.get("has_block"))
@@ -79,20 +78,6 @@ def should_send_tier(tier: str) -> bool:
 
 
 def evaluate_signal_quality(meta: Dict) -> Dict:
-    """
-    Wrapper untuk dipanggil dari analyzer.
-
-    meta minimal berisi:
-    {
-      "has_block": bool,
-      "impulse_ok": bool,
-      "touch_ok": bool,
-      "reaction_ok": bool,
-      "rr_ok": bool,
-      "sl_pct": float,
-      "htf_alignment": bool,
-    }
-    """
     score = score_signal(meta)
     tier = tier_from_score(score)
     send = should_send_tier(tier)
