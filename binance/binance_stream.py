@@ -1,11 +1,10 @@
 # binance/binance_stream.py
 # WebSocket scanner Binance Futures 5m + IMB analyzer.
-# Versi single-WebSocket (gaya bot 1) + preload 5m.
 
 import asyncio
 import json
 import time
-from typing import List
+from typing import Dict, List
 
 import requests
 import websockets
@@ -23,9 +22,8 @@ from core.bot_state import (
 from imb.imb_detector import analyze_symbol_imb
 from telegram.telegram_broadcast import broadcast_signal
 
-# maksimum candle 5m yang disimpan per symbol
+
 MAX_5M_CANDLES = 120
-# jumlah candle preload via REST
 PRELOAD_LIMIT_5M = 60
 
 
@@ -38,17 +36,7 @@ def _fetch_klines(symbol: str, interval: str, limit: int) -> List[list]:
 
 
 async def run_imb_bot():
-    """
-    Main loop IMB bot:
-    - Load subscribers/VIP/state
-    - Ambil daftar pair USDT perpetual (filter volume)
-    - Preload 5m history via REST
-    - Hubungkan satu WebSocket multi-stream kline_5m
-    - Build candle 5m per symbol di memori
-    - Saat candle 5m close → analisa IMB → kirim sinyal
-    """
-
-    # ===== INIT STATE =====
+    # Load state persistent
     state.subscribers = load_subscribers()
     state.vip_users = load_vip_users()
     state.daily_date = time.strftime("%Y-%m-%d")
@@ -63,7 +51,6 @@ async def run_imb_bot():
 
     ohlc_mgr = OHLCBufferManager(max_candles=MAX_5M_CANDLES)
 
-    # ===== MAIN LOOP =====
     while state.running:
         try:
             now = time.time()
@@ -73,19 +60,12 @@ async def run_imb_bot():
                 or state.force_pairs_refresh
             )
 
-            # ---------- REFRESH PAIR LIST + PRELOAD ----------
             if need_refresh_pairs:
                 print("Refresh daftar pair USDT perpetual berdasarkan volume...")
                 symbols = get_usdt_pairs(state.max_pairs, state.min_volume_usdt)
                 last_pairs_refresh = now
                 state.force_pairs_refresh = False
-
                 print(f"Scan {len(symbols)} pair:", ", ".join(s.upper() for s in symbols))
-
-                if not symbols:
-                    print("Tidak ada symbol untuk discan. Tidur sebentar...")
-                    await asyncio.sleep(5)
-                    continue
 
                 # preload 60 candle 5m untuk tiap symbol
                 print(f"Mulai preload history 5m untuk {len(symbols)} symbol (limit={PRELOAD_LIMIT_5M})...")
@@ -93,19 +73,16 @@ async def run_imb_bot():
                     try:
                         kl = _fetch_klines(sym.upper(), "5m", PRELOAD_LIMIT_5M)
                         ohlc_mgr.preload_candles(sym.upper(), kl)
-                        if state.debug:
-                            print(f"[PRELOAD] {sym.upper()} → {len(kl)} candle 5m dimuat.")
                     except Exception as e:
                         print(f"[{sym}] Gagal preload 5m:", e)
                         continue
-                print("Preload history 5m selesai.")
+                print("Preload selesai.")
 
             if not symbols:
                 print("Tidak ada symbol untuk discan. Tidur sebentar...")
                 await asyncio.sleep(5)
                 continue
 
-            # ---------- BUILD SINGLE WEBSOCKET MULTI-STREAM ----------
             streams = "/".join(f"{s}@kline_5m" for s in symbols)
             ws_url = f"{BINANCE_STREAM_URL}?streams={streams}"
 
@@ -117,15 +94,12 @@ async def run_imb_bot():
                 else:
                     print("Bot dalam mode STANDBY. Gunakan /startscan untuk mulai scan.\n")
 
-                # ---------- WS LOOP ----------
                 while state.running:
-                    # soft restart diminta dari Telegram
                     if state.request_soft_restart:
-                        print("Soft restart diminta → memutus WS & refresh engine...")
+                        print("Soft restart diminta → putus WS & refresh engine...")
                         state.request_soft_restart = False
                         break
 
-                    # perlu refresh daftar pair?
                     if time.time() - last_pairs_refresh > refresh_interval:
                         print("Interval refresh pair tercapai → refresh daftar pair & reconnect WebSocket...")
                         break
@@ -137,7 +111,6 @@ async def run_imb_bot():
                             print("Timeout menunggu data WebSocket, lanjut...")
                         continue
 
-                    # parse pesan
                     try:
                         data = json.loads(msg)
                     except json.JSONDecodeError:
@@ -153,16 +126,14 @@ async def run_imb_bot():
                     if not symbol:
                         continue
 
-                    # update buffer 5m
+                    # update buffer
                     ohlc_mgr.update_from_kline(symbol, kline)
                     candle_closed = bool(kline.get("x", False))
 
-                    # log seperti bot 1 (hanya kalau debug ON)
                     if state.debug and candle_closed:
                         buf_len = len(ohlc_mgr.get_candles(symbol))
                         print(f"[{time.strftime('%H:%M:%S')}] 5m close: {symbol} — total candle: {buf_len}")
 
-                    # hanya analisa ketika candle close + scanning aktif
                     if not candle_closed:
                         continue
                     if not state.scanning:
@@ -172,7 +143,6 @@ async def run_imb_bot():
                     if len(candles) < 40:
                         continue
 
-                    # cooldown per symbol
                     now_ts = time.time()
                     if state.cooldown_seconds > 0:
                         last_ts = state.last_signal_time.get(symbol)
@@ -184,7 +154,6 @@ async def run_imb_bot():
                                 )
                             continue
 
-                    # ---------- ANALISA IMB ----------
                     result = analyze_symbol_imb(symbol, candles)
                     if not result:
                         continue
