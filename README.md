@@ -7,14 +7,15 @@ Bot otomatis scan banyak pair USDT di Binance Futures, lalu kirim sinyal ketika 
 
 Contoh format sinyal:
 
-🟢 IMB SIGNAL — ETHUSDT (LONG)
-Entry : 2380.50
-SL    : 2368.20
-TP1   : 2396.40
-TP2   : 2410.80
-TP3   : 2435.00
-Model : Displacement → IMB Mitigation Entry
-Rekomendasi Leverage : 10x–20x
+
+🟢 SMC SIGNAL — BTCUSDT (LONG)  
+Entry : 67350  
+SL    : 67080  
+TP1   : 67500  
+TP2   : 67720  
+TP3   : 68100  
+Model : Displacement → IMB Mitigation Entry  
+Rekomendasi Leverage : 15x–25x (SL 0.40%)
 
 ---
 
