@@ -1,259 +1,245 @@
 # imb/imb_detector.py
-# Deteksi IMB (Institutional Mitigation Block) + scoring + build signal text.
+# Deteksi setup IMB (Institutional Mitigation Block) + bangun Entry/SL/TP.
 
-from typing import List, Dict, Optional, Literal
+from typing import Dict, List, Optional, Tuple
 
 from binance.ohlc_buffer import Candle
-from imb.imb_settings import imb_settings
+from core.imb_settings import imb_settings
 from imb.htf_context import get_htf_context
-from imb.imb_tiers import evaluate_imb_quality
+from imb.imb_tiers import evaluate_signal_quality
 
 
-def _avg_body(candles: List[Candle], count: int) -> float:
-    n = min(len(candles), count)
-    if n <= 0:
+def _avg_body(candles: List[Candle], lookback: int = 30) -> float:
+    sub = candles[-lookback:] if len(candles) > lookback else candles
+    if not sub:
         return 0.0
     total = 0.0
-    for c in candles[-n:]:
+    for c in sub:
         total += abs(c["close"] - c["open"])
-    return total / n
+    return total / len(sub)
 
 
-def _detect_impulse(candles: List[Candle]) -> Optional[Dict]:
+def _find_impulse(candles: List[Candle]) -> Optional[int]:
     """
-    Cari impuls terakhir (bullish atau bearish) di beberapa candle terakhir.
-    Impuls = body besar & close dekat ekstrem.
+    Cari candle impuls terakhir (body > factor * rata2 body).
+    Return index candle impuls atau None.
     """
-    if len(candles) < 15:
+    if len(candles) < 20:
         return None
 
-    # cek beberapa candle terakhir
-    lookback = min(20, len(candles))
-    segment = candles[-lookback:]
-    avg_body10 = _avg_body(segment[:-1], 10)
+    avg = _avg_body(candles, lookback=30)
+    if avg <= 0:
+        return None
 
+    factor = 1.8
+    # fokus di ~20 candle terakhir
+    start = max(0, len(candles) - 20)
     best_idx = None
-    best_strength = 0.0
-    direction: Optional[Literal["long", "short"]] = None
+    best_body = 0.0
 
-    for i in range(len(segment)):
-        c = segment[i]
-        body = abs(c["close"] - c["open"])
-        if body <= 0 or avg_body10 <= 0:
-            continue
-
-        strength = body / avg_body10
-        if strength < 1.5:
-            continue
-
-        high = c["high"]
-        low = c["low"]
-        close = c["close"]
-        op = c["open"]
-
-        # close dekat high → impuls bullish
-        if close > op and high > low:
-            pos = (close - low) / (high - low)
-            if pos >= 0.7 and strength > best_strength:
-                best_strength = strength
-                direction = "long"
-                best_idx = len(candles) - lookback + i
-
-        # close dekat low → impuls bearish
-        if close < op and high > low:
-            pos = (close - low) / (high - low)
-            if pos <= 0.3 and strength > best_strength:
-                best_strength = strength
-                direction = "short"
-                best_idx = len(candles) - lookback + i
-
-    if best_idx is None or direction is None:
-        return None
-
-    return {"index": best_idx, "side": direction, "strength": best_strength}
-
-
-def _find_imb_block(candles: List[Candle], impulse_index: int, side: str) -> Optional[Dict]:
-    """
-    Cari candle block sebelum impuls:
-    - long: cari candle bearish terakhir sebelum impuls
-    - short: cari candle bullish terakhir sebelum impuls
-    """
-    if impulse_index <= 0:
-        return None
-
-    block_idx = None
-    for i in range(impulse_index - 1, max(impulse_index - 8, -1), -1):
+    for i in range(start, len(candles)):
         c = candles[i]
-        if side == "long" and c["close"] < c["open"]:  # bearish
-            block_idx = i
-            break
-        if side == "short" and c["close"] > c["open"]:  # bullish
-            block_idx = i
-            break
+        body = abs(c["close"] - c["open"])
+        if body > factor * avg and body > best_body:
+            best_body = body
+            best_idx = i
 
-    if block_idx is None:
+    return best_idx
+
+
+def _find_block(candles: List[Candle], impulse_idx: int) -> Optional[Tuple[float, float, str]]:
+    """
+    Temukan blok IMB sederhana:
+    - untuk impuls naik → blok adalah range dari 1–3 candle bearish sebelum impuls
+    - untuk impuls turun → blok adalah range dari 1–3 candle bullish sebelum impuls
+    Return (block_low, block_high, side) atau None.
+    """
+    if impulse_idx is None or impulse_idx <= 0:
         return None
 
-    block = candles[block_idx]
-    block_high = block["high"]
-    block_low = block["low"]
+    imp = candles[impulse_idx]
+    side = "long" if imp["close"] > imp["open"] else "short"
+
+    start = max(0, impulse_idx - 3)
+    end = impulse_idx
+
+    highs: List[float] = []
+    lows: List[float] = []
+
+    for i in range(start, end):
+        c = candles[i]
+        if side == "long":
+            # cari candle merah sebelum impuls hijau
+            if c["close"] < c["open"]:
+                highs.append(c["high"])
+                lows.append(c["low"])
+        else:
+            # side short → cari candle hijau
+            if c["close"] > c["open"]:
+                highs.append(c["high"])
+                lows.append(c["low"])
+
+    if not highs or not lows:
+        return None
+
+    block_high = max(highs)
+    block_low = min(lows)
+
+    # validasi range tidak aneh
     if block_high <= block_low:
         return None
 
-    # range block tidak boleh terlalu besar
-    mid_price = candles[impulse_index]["close"]
-    range_pct = (block_high - block_low) / mid_price if mid_price != 0 else 0
-    if range_pct > 0.008:  # max ~0.8% block
-        return None
-
-    return {
-        "index": block_idx,
-        "high": block_high,
-        "low": block_low,
-        "range_pct": range_pct,
-    }
+    return block_low, block_high, side
 
 
-def _build_levels(side: str, block: Dict, candles: List[Candle], impulse_idx: int) -> Dict:
-    """
-    Entry di mid block.
-    SL di luar block dengan buffer kecil.
-    TP pakai RR ke risk (RR 1.2, 2, 3).
-    """
-    block_high = block["high"]
-    block_low = block["low"]
-    mid = (block_high + block_low) / 2.0
-
-    # gunakan close impuls sebagai referensi untuk buffer
-    ref_price = candles[impulse_idx]["close"]
-    if ref_price <= 0:
-        ref_price = mid
-
-    buffer = ref_price * 0.0005  # 0.05% buffer
-
+def _build_levels(
+    side: str,
+    block_low: float,
+    block_high: float,
+    last_price: float,
+    rr1: float = 1.2,
+    rr2: float = 2.0,
+    rr3: float = 3.0,
+) -> Dict[str, float]:
+    # Entry: gunakan ekstrem blok, tapi jangan terlalu jauh dari harga terakhir
     if side == "long":
-        entry = mid
-        sl = block_low - buffer
+        raw_entry = block_low
+        entry = min(raw_entry, last_price)  # anti FOMO sedikit
+        sl = block_low * 0.997  # sedikit buffer di bawah blok
         risk = entry - sl
-        tp1 = entry + 1.2 * risk
-        tp2 = entry + 2.0 * risk
-        tp3 = entry + 3.0 * risk
     else:
-        entry = mid
-        sl = block_high + buffer
+        raw_entry = block_high
+        entry = max(raw_entry, last_price)
+        sl = block_high * 1.003
         risk = sl - entry
-        tp1 = entry - 1.2 * risk
-        tp2 = entry - 2.0 * risk
-        tp3 = entry - 3.0 * risk
 
     if risk <= 0:
         risk = abs(entry) * 0.003
 
+    if side == "long":
+        tp1 = entry + rr1 * risk
+        tp2 = entry + rr2 * risk
+        tp3 = entry + rr3 * risk
+    else:
+        tp1 = entry - rr1 * risk
+        tp2 = entry - rr2 * risk
+        tp3 = entry - rr3 * risk
+
     sl_pct = abs(risk / entry) * 100.0 if entry != 0 else 0.0
+    lev_min, lev_max = recommend_leverage_range(sl_pct)
+
     return {
         "entry": float(entry),
         "sl": float(sl),
         "tp1": float(tp1),
         "tp2": float(tp2),
         "tp3": float(tp3),
-        "risk": float(risk),
         "sl_pct": float(sl_pct),
+        "lev_min": float(lev_min),
+        "lev_max": float(lev_max),
     }
+
+
+def recommend_leverage_range(sl_pct: float) -> Tuple[float, float]:
+    """
+    Rekomendasi leverage rentang berdasarkan SL% (risk per posisi jika 1x).
+    Sama gaya dengan bot pertama.
+    """
+    if sl_pct <= 0:
+        return 5.0, 10.0
+
+    if sl_pct <= 0.25:
+        return 25.0, 40.0
+    elif sl_pct <= 0.50:
+        return 15.0, 25.0
+    elif sl_pct <= 0.80:
+        return 8.0, 15.0
+    elif sl_pct <= 1.20:
+        return 5.0, 8.0
+    else:
+        return 3.0, 5.0
 
 
 def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     """
-    IMB murni:
-    - deteksi impuls 5m
-    - cari mitigation block sebelum impuls
-    - bangun Entry/SL/TP
-    - filter HTF (optional)
-    - scoring & tier
+    Analisa IMB untuk satu symbol menggunakan data 5m.
+    Flow:
+    - cari impuls kuat terakhir
+    - temukan blok IMB sebelum impuls
+    - bangun Entry/SL/TP berdasarkan blok
+    - cek RR & SL%
+    - cek konteks HTF
+    - skor & tier → hanya kirim jika >= min_tier
     """
-    if len(candles_5m) < 30:
+    if len(candles_5m) < 40:
         return None
 
-    # 1) deteksi impuls
-    impulse = _detect_impulse(candles_5m)
-    if not impulse:
+    imp_idx = _find_impulse(candles_5m)
+    if imp_idx is None:
         return None
 
-    side = impulse["side"]
-    impulse_idx = impulse["index"]
-
-    # validitas umur setup: impuls harus termasuk dalam max_entry_age
-    last_idx = len(candles_5m) - 1
-    age_candles = last_idx - impulse_idx
-    if age_candles > imb_settings.max_entry_age_candles:
-        return None
-
-    # 2) cari IMB block
-    block = _find_imb_block(candles_5m, impulse_idx, side)
+    block = _find_block(candles_5m, imp_idx)
     if not block:
         return None
 
-    # 3) build level
-    levels = _build_levels(side, block, candles_5m, impulse_idx)
+    block_low, block_high, side = block
+    last_price = candles_5m[-1]["close"]
+
+    levels = _build_levels(side, block_low, block_high, last_price)
 
     entry = levels["entry"]
     sl = levels["sl"]
+    tp1 = levels["tp1"]
     tp2 = levels["tp2"]
-    risk = levels["risk"]
+    tp3 = levels["tp3"]
+    sl_pct = levels["sl_pct"]
 
-    if risk <= 0 or entry == 0:
+    # validasi RR (TP2 ≥ ~2R)
+    risk = abs(entry - sl)
+    if risk <= 0:
         return None
-
     rr_tp2 = abs(tp2 - entry) / risk
-    if rr_tp2 < imb_settings.min_rr_tp2:
-        return None
+    rr_ok = rr_tp2 >= 1.8
 
-    # 4) HTF context
-    htf_ctx = get_htf_context(symbol) if imb_settings.use_htf_filter else {
-        "htf_ok_long": True,
-        "htf_ok_short": True,
-        "trend_1h": "RANGE",
-        "pos_1h": "MID",
-        "pos_15m": "MID",
-    }
+    # konteks HTF
+    htf_ctx = get_htf_context(symbol)
+    if side == "long":
+        htf_alignment = bool(htf_ctx.get("htf_ok_long", True))
+    else:
+        htf_alignment = bool(htf_ctx.get("htf_ok_short", True))
 
-    if side == "long" and not htf_ctx.get("htf_ok_long", True):
-        return None
-    if side == "short" and not htf_ctx.get("htf_ok_short", True):
-        return None
-
-    # 5) scoring & tier
+    # meta untuk skoring
     meta = {
-        "side": side,
-        "sl_pct": levels["sl_pct"],
-        "rr_tp2": rr_tp2,
-        "impulse_strength": float(impulse["strength"]),
-        "block_range_pct": float(block["range_pct"]),
-        "htf_alignment": bool(
-            htf_ctx.get("htf_ok_long") if side == "long" else htf_ctx.get("htf_ok_short")
-        ),
+        "has_block": True,
+        "impulse_ok": True,
+        "touch_ok": True,        # versi awal: kita anggap blok valid jika sudah terbentuk
+        "reaction_ok": True,     # bisa di-refine nanti
+        "rr_ok": rr_ok,
+        "sl_pct": sl_pct,
+        "htf_alignment": htf_alignment,
     }
-    q = evaluate_imb_quality(meta)
+
+    q = evaluate_signal_quality(meta)
     if not q["should_send"]:
         return None
 
     tier = q["tier"]
     score = q["score"]
 
-    # 6) build message (format mirip bot 1)
     direction_label = "LONG" if side == "long" else "SHORT"
     emoji = "🟢" if side == "long" else "🔴"
 
-    sl_pct_text = f"{levels['sl_pct']:.2f}%"
-    # rekomendasi leverage mirip mapping SL%
-    lev_min, lev_max = _recommend_leverage(levels["sl_pct"])
+    lev_min = levels["lev_min"]
+    lev_max = levels["lev_max"]
     lev_text = f"{lev_min:.0f}x–{lev_max:.0f}x"
+    sl_pct_text = f"{sl_pct:.2f}%"
 
-    approx_minutes = imb_settings.max_entry_age_candles * 5
+    # validitas sinyal (misal 6 candle 5m = 30 menit)
+    max_age_candles = imb_settings.max_entry_age_candles
+    approx_minutes = max_age_candles * 5
     valid_text = f"±{approx_minutes} menit" if approx_minutes > 0 else "singkat"
 
-    # Risk calc mini 1% balance
-    sl_pct = levels["sl_pct"]
+    # Risk calculator mini
     if sl_pct > 0:
         pos_mult = 100.0 / sl_pct
         example_balance = 100.0
@@ -269,12 +255,12 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
 
     text = (
         f"{emoji} IMB SIGNAL — {symbol.upper()} ({direction_label})\n"
-        f"Entry : `{levels['entry']:.6f}`\n"
-        f"SL    : `{levels['sl']:.6f}`\n"
-        f"TP1   : `{levels['tp1']:.6f}`\n"
-        f"TP2   : `{levels['tp2']:.6f}`\n"
-        f"TP3   : `{levels['tp3']:.6f}`\n"
-        f"Model : Institutional Mitigation Block (IMB)\n"
+        f"Entry : `{entry:.6f}`\n"
+        f"SL    : `{sl:.6f}`\n"
+        f"TP1   : `{tp1:.6f}`\n"
+        f"TP2   : `{tp2:.6f}`\n"
+        f"TP3   : `{tp3:.6f}`\n"
+        f"Model : IMB Mitigation Block\n"
         f"Rekomendasi Leverage : {lev_text} (SL {sl_pct_text})\n"
         f"Validitas Entry : {valid_text}\n"
         f"Tier : {tier} (Score {score})\n"
@@ -284,29 +270,16 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     return {
         "symbol": symbol.upper(),
         "side": side,
-        "entry": levels["entry"],
-        "sl": levels["sl"],
-        "tp1": levels["tp1"],
-        "tp2": levels["tp2"],
-        "tp3": levels["tp3"],
-        "sl_pct": levels["sl_pct"],
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "sl_pct": sl_pct,
+        "lev_min": lev_min,
+        "lev_max": lev_max,
         "tier": tier,
         "score": score,
         "htf_context": htf_ctx,
         "message": text,
     }
-
-
-def _recommend_leverage(sl_pct: float) -> tuple[float, float]:
-    if sl_pct <= 0:
-        return 5.0, 10.0
-    if sl_pct <= 0.25:
-        return 25.0, 40.0
-    elif sl_pct <= 0.50:
-        return 15.0, 25.0
-    elif sl_pct <= 0.80:
-        return 8.0, 15.0
-    elif sl_pct <= 1.20:
-        return 5.0, 8.0
-    else:
-        return 3.0, 5.0
