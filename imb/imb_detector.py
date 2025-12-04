@@ -104,7 +104,7 @@ def _build_levels(
     """
     Bangun Entry/SL/TP dengan gaya mirip bot 1:
     - Entry tetap berbasis blok IMB (low/high blok)
-    - SL = ekstrem blok ± buffer dinamis (bukan fixed %)
+    - SL = ekstrem blok ± buffer dinamis, tapi tetap di sisi yang benar
     - TP = kelipatan R (RR1 / RR2 / RR3)
     """
     if side == "long":
@@ -112,8 +112,8 @@ def _build_levels(
         raw_entry = block_low
         entry = min(raw_entry, last_price)
 
-        sl_base = block_low
-        # buffer dinamis ala bot 1
+        # pastikan basis SL tidak di atas entry
+        sl_base = min(block_low, entry)
         buffer = max(sl_base * 0.0015, abs(entry) * 0.0005)
         sl = sl_base - buffer
 
@@ -123,15 +123,20 @@ def _build_levels(
         raw_entry = block_high
         entry = max(raw_entry, last_price)
 
-        sl_base = block_high
+        # pastikan basis SL tidak di bawah entry
+        sl_base = max(block_high, entry)
         buffer = max(sl_base * 0.0015, abs(entry) * 0.0005)
         sl = sl_base + buffer
 
         risk = sl - entry
 
     if risk <= 0:
-        # fallback kecil
+        # fallback kecil agar tetap ada jarak yang masuk akal
         risk = abs(entry) * 0.003
+        if side == "long":
+            sl = entry - risk
+        else:
+            sl = entry + risk
 
     # TP berdasarkan RR
     if side == "long":
@@ -155,7 +160,8 @@ def _build_levels(
         "sl_pct": float(sl_pct),
         "lev_min": float(lev_min),
         "lev_max": float(lev_max),
-    }
+            }
+
 
 
 def recommend_leverage_range(sl_pct: float) -> Tuple[float, float]:
