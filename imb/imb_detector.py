@@ -103,13 +103,14 @@ def _build_levels(
 ) -> Dict[str, float]:
     """
     Bangun Entry/SL/TP dengan gaya mirip bot 1:
-    - Entry di level blok IMB (low/high blok)
-    - SL = ekstrem blok ± buffer dinamis
+    - Entry tetap berbasis blok IMB (low/high blok)
+    - SL = ekstrem blok ± buffer dinamis (bukan fixed %)
     - TP = kelipatan R (RR1 / RR2 / RR3)
     """
     if side == "long":
-        # Entry di low blok (limit order di blok)
-        entry = block_low
+        # Entry di dekat low blok, tapi jangan di atas harga terakhir (anti FOMO)
+        raw_entry = block_low
+        entry = min(raw_entry, last_price)
 
         sl_base = block_low
         buffer = max(sl_base * 0.0015, abs(entry) * 0.0005)
@@ -117,8 +118,9 @@ def _build_levels(
 
         risk = entry - sl
     else:
-        # SHORT → entry di high blok
-        entry = block_high
+        # SHORT
+        raw_entry = block_high
+        entry = max(raw_entry, last_price)
 
         sl_base = block_high
         buffer = max(sl_base * 0.0015, abs(entry) * 0.0005)
@@ -126,9 +128,9 @@ def _build_levels(
 
         risk = sl - entry
 
-    # kalau tetap aneh, buang saja setup
     if risk <= 0:
-        return {}
+        # fallback kecil
+        risk = abs(entry) * 0.003
 
     # TP berdasarkan RR
     if side == "long":
@@ -154,6 +156,7 @@ def _build_levels(
         "lev_max": float(lev_max),
     }
 
+
 def recommend_leverage_range(sl_pct: float) -> Tuple[float, float]:
     """
     Rekomendasi leverage rentang berdasarkan SL% (risk per posisi jika 1x).
@@ -177,21 +180,25 @@ def recommend_leverage_range(sl_pct: float) -> Tuple[float, float]:
 def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     """
     Analisa IMB untuk satu symbol menggunakan data 5m.
+
     Flow:
-    - cari impuls kuat terakhir
-    - temukan blok IMB sebelum impuls
-    - bangun Entry/SL/TP berdasarkan blok
-    - cek RR & SL%
-    - cek konteks HTF (kalau diaktifkan)
-    - skor & tier → hanya kirim jika >= min_tier
+    1) Cari impuls kuat terakhir (5m)
+    2) Temukan blok IMB sebelum impuls
+    3) Bangun Entry/SL/TP berbasis blok
+    4) Cek RR & SL% → kalau tidak lolos, STOP (tidak panggil HTF)
+    5) Baru panggil konteks HTF (15m & 1h) jika diaktifkan
+    6) Skor & Tier → hanya kirim jika >= min_tier (state.min_tier)
     """
+    # 1) Pastikan cukup candle
     if len(candles_5m) < 40:
         return None
 
+    # 2) Impulse
     imp_idx = _find_impulse(candles_5m)
     if imp_idx is None:
         return None
 
+    # 3) Blok IMB
     block = _find_block(candles_5m, imp_idx)
     if not block:
         return None
@@ -199,10 +206,9 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     block_low, block_high, side = block
     last_price = candles_5m[-1]["close"]
 
+    # 4) Bangun level + cek RR / SL dulu (tanpa HTF)
     levels = _build_levels(side, block_low, block_high, last_price)
-    if not levels:
-        return None
-    
+
     entry = levels["entry"]
     sl = levels["sl"]
     tp1 = levels["tp1"]
@@ -214,11 +220,16 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     risk = abs(entry - sl)
     if risk <= 0:
         return None
+
     rr_tp2 = abs(tp2 - entry) / risk
     min_rr = imb_settings.min_rr_tp2
     rr_ok = rr_tp2 >= min_rr
 
-    # konteks HTF (respect IMB_USE_HTF_FILTER)
+    if not rr_ok:
+        # RR jelek → tidak usah lanjut HTF
+        return None
+
+    # 5) Konteks HTF (15m & 1h) — hanya kalau diaktifkan
     if imb_settings.use_htf_filter:
         htf_ctx = get_htf_context(symbol)
         if side == "long":
@@ -235,11 +246,11 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
         }
         htf_alignment = True
 
-    # meta untuk skoring
+    # 6) Meta untuk skoring
     meta = {
         "has_block": True,
         "impulse_ok": True,
-        "touch_ok": True,        # versi awal: kita anggap blok valid jika sudah terbentuk
+        "touch_ok": True,        # versi awal: dianggap valid saat blok terbentuk
         "reaction_ok": True,     # bisa di-refine nanti
         "rr_ok": rr_ok,
         "sl_pct": sl_pct,
@@ -253,6 +264,7 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     tier = q["tier"]
     score = q["score"]
 
+    # 7) Build pesan Telegram
     direction_label = "LONG" if side == "long" else "SHORT"
     emoji = "🟢" if side == "long" else "🔴"
 
@@ -261,7 +273,7 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     lev_text = f"{lev_min:.0f}x–{lev_max:.0f}x"
     sl_pct_text = f"{sl_pct:.2f}%"
 
-    # validitas sinyal: ambil dari IMB_MAX_ENTRY_AGE_CANDLES (5m per candle)
+    # validitas sinyal (pakai IMB_MAX_ENTRY_AGE_CANDLES dari config/env)
     max_age_candles = imb_settings.max_entry_age_candles
     approx_minutes = max_age_candles * 5
     valid_text = f"±{approx_minutes} menit" if approx_minutes > 0 else "singkat"
@@ -309,4 +321,4 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
         "score": score,
         "htf_context": htf_ctx,
         "message": text,
-        }
+    }
