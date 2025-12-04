@@ -2,6 +2,7 @@
 # Deteksi setup IMB (Institutional Mitigation Block) + bangun Entry/SL/TP.
 
 from typing import Dict, List, Optional, Tuple
+import numpy as np
 
 from binance.ohlc_buffer import Candle
 from core.imb_settings import imb_settings
@@ -9,22 +10,58 @@ from imb.htf_context import get_htf_context
 from imb.imb_tiers import evaluate_signal_quality
 
 
-def _avg_body(candles: List[Candle], lookback: int = 30) -> float:
-    sub = candles[-lookback:] if len(candles) > lookback else candles
-    if not sub:
-        return 0.0
-    total = 0.0
-    for c in sub:
-        total += abs(c["close"] - c["open"])
-    return total / len(sub)
+# ==============================
+# NumPy helper
+# ==============================
 
+def _candle_arrays(candles: List[Candle]):
+    """
+    Convert list Candle -> NumPy arrays:
+    opens, highs, lows, closes
+    """
+    if not candles:
+        return None, None, None, None
+
+    opens = np.fromiter((c["open"] for c in candles), dtype=float)
+    highs = np.fromiter((c["high"] for c in candles), dtype=float)
+    lows = np.fromiter((c["low"] for c in candles), dtype=float)
+    closes = np.fromiter((c["close"] for c in candles), dtype=float)
+
+    return opens, highs, lows, closes
+
+
+# ==============================
+# Optimized function: _avg_body
+# ==============================
+
+def _avg_body(candles: List[Candle], lookback: int = 30) -> float:
+    if not candles:
+        return 0.0
+
+    opens, _, _, closes = _candle_arrays(candles)
+    if opens is None or closes is None or opens.size == 0:
+        return 0.0
+
+    # Tail sesuai lookback
+    if lookback and opens.size > lookback:
+        opens = opens[-lookback:]
+        closes = closes[-lookback:]
+
+    bodies = np.abs(closes - opens)
+    return float(bodies.mean()) if bodies.size > 0 else 0.0
+
+
+# ==============================
+# Optimized function: _find_impulse
+# ==============================
 
 def _find_impulse(candles: List[Candle]) -> Optional[int]:
     """
     Cari candle impuls terakhir (body > factor * rata2 body).
-    Return index candle impuls atau None.
+    NumPy-accelerated version.
     """
-    if len(candles) < 20:
+    n = len(candles)
+    if n < 20:
         return None
 
     avg = _avg_body(candles, lookback=30)
@@ -32,20 +69,30 @@ def _find_impulse(candles: List[Candle]) -> Optional[int]:
         return None
 
     factor = 1.8
+
+    opens, _, _, closes = _candle_arrays(candles)
+    if opens is None or closes is None:
+        return None
+
+    bodies = np.abs(closes - opens)
+
     # fokus di ~20 candle terakhir
-    start = max(0, len(candles) - 20)
-    best_idx = None
-    best_body = 0.0
+    start = max(0, n - 20)
+    tail = bodies[start:]
 
-    for i in range(start, len(candles)):
-        c = candles[i]
-        body = abs(c["close"] - c["open"])
-        if body > factor * avg and body > best_body:
-            best_body = body
-            best_idx = i
+    mask = tail > (factor * avg)
+    if not mask.any():
+        return None
 
+    idx_candidates = np.nonzero(mask)[0] + start
+    best_local = bodies[idx_candidates].argmax()
+    best_idx = int(idx_candidates[best_local])
     return best_idx
 
+
+# ====================================
+# ORIGINAL — tetap, tidak dioptimasi
+# ====================================
 
 def _find_block(candles: List[Candle], impulse_idx: int) -> Optional[Tuple[float, float, str]]:
     """
@@ -69,12 +116,10 @@ def _find_block(candles: List[Candle], impulse_idx: int) -> Optional[Tuple[float
     for i in range(start, end):
         c = candles[i]
         if side == "long":
-            # cari candle merah sebelum impuls hijau
             if c["close"] < c["open"]:
                 highs.append(c["high"])
                 lows.append(c["low"])
         else:
-            # side short → cari candle hijau
             if c["close"] > c["open"]:
                 highs.append(c["high"])
                 lows.append(c["low"])
@@ -85,7 +130,6 @@ def _find_block(candles: List[Candle], impulse_idx: int) -> Optional[Tuple[float
     block_high = max(highs)
     block_low = min(lows)
 
-    # validasi range tidak aneh
     if block_high <= block_low:
         return None
 
@@ -101,11 +145,10 @@ def _build_levels(
     rr2: float = 2.0,
     rr3: float = 3.0,
 ) -> Dict[str, float]:
-    # Entry: gunakan ekstrem blok, tapi jangan terlalu jauh dari harga terakhir
     if side == "long":
         raw_entry = block_low
-        entry = min(raw_entry, last_price)  # anti FOMO sedikit
-        sl = block_low * 0.997  # sedikit buffer di bawah blok
+        entry = min(raw_entry, last_price)
+        sl = block_low * 0.997
         risk = entry - sl
     else:
         raw_entry = block_high
@@ -141,13 +184,8 @@ def _build_levels(
 
 
 def recommend_leverage_range(sl_pct: float) -> Tuple[float, float]:
-    """
-    Rekomendasi leverage rentang berdasarkan SL% (risk per posisi jika 1x).
-    Sama gaya dengan bot pertama.
-    """
     if sl_pct <= 0:
         return 5.0, 10.0
-
     if sl_pct <= 0.25:
         return 25.0, 40.0
     elif sl_pct <= 0.50:
@@ -161,16 +199,6 @@ def recommend_leverage_range(sl_pct: float) -> Tuple[float, float]:
 
 
 def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
-    """
-    Analisa IMB untuk satu symbol menggunakan data 5m.
-    Flow:
-    - cari impuls kuat terakhir
-    - temukan blok IMB sebelum impuls
-    - bangun Entry/SL/TP berdasarkan blok
-    - cek RR & SL%
-    - cek konteks HTF
-    - skor & tier → hanya kirim jika >= min_tier
-    """
     if len(candles_5m) < 40:
         return None
 
@@ -194,57 +222,46 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     tp3 = levels["tp3"]
     sl_pct = levels["sl_pct"]
 
-    # validasi RR (TP2 ≥ ~2R)
     risk = abs(entry - sl)
     if risk <= 0:
         return None
+
     rr_tp2 = abs(tp2 - entry) / risk
     rr_ok = rr_tp2 >= 1.8
 
-    # konteks HTF
     htf_ctx = get_htf_context(symbol)
     if side == "long":
         htf_alignment = bool(htf_ctx.get("htf_ok_long", True))
     else:
         htf_alignment = bool(htf_ctx.get("htf_ok_short", True))
 
-    # === STRICT MODE FILTER ===
     if imb_settings.strict_mode:
-        # impuls harus jauh lebih kuat dari rata2 body
         avg_body = _avg_body(candles_5m)
         imp_candle = candles_5m[imp_idx]
         imp_body = abs(imp_candle["close"] - imp_candle["open"])
         if imp_body < 2.5 * avg_body:
             return None
 
-        # SL% lebih ketat
         if not (0.20 <= sl_pct <= 0.80):
             return None
 
-        # RR TP2 minimal 2.0R
-        risk = abs(entry - sl)
-        if risk <= 0:
-            return None
-        rr_tp2_value = abs(tp2 - entry) / risk
+        rr_tp2_value = abs(tp2 - entry) / abs(entry - sl)
         if rr_tp2_value < 2.0:
             return None
 
-        # HTF Wajib sinkron
         if not htf_alignment:
             return None
 
-        # entry tidak boleh terlalu jauh dari harga sekarang (>0.30%)
         last_price = candles_5m[-1]["close"]
         distance_pct = abs((entry - last_price) / last_price) * 100
         if distance_pct > 0.30:
             return None
 
-    # meta untuk skoring
     meta = {
         "has_block": True,
         "impulse_ok": True,
-        "touch_ok": True,        # versi awal: kita anggap blok valid jika sudah terbentuk
-        "reaction_ok": True,     # bisa di-refine nanti
+        "touch_ok": True,
+        "reaction_ok": True,
         "rr_ok": rr_ok,
         "sl_pct": sl_pct,
         "htf_alignment": htf_alignment,
@@ -265,12 +282,10 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     lev_text = f"{lev_min:.0f}x–{lev_max:.0f}x"
     sl_pct_text = f"{sl_pct:.2f}%"
 
-    # validitas sinyal (misal 6 candle 5m = 30 menit)
     max_age_candles = imb_settings.max_entry_age_candles
     approx_minutes = max_age_candles * 5
     valid_text = f"±{approx_minutes} menit" if approx_minutes > 0 else "singkat"
 
-    # Risk calculator mini
     if sl_pct > 0:
         pos_mult = 100.0 / sl_pct
         example_balance = 100.0
