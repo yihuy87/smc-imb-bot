@@ -12,9 +12,18 @@ import requests
 from config import BINANCE_REST_URL
 
 
-# Cache HTF per symbol (biar tidak spam REST ke Binance)
-HTF_CACHE_TTL = 120  # detik
-_htf_cache: Dict[str, Dict[str, object]] = {}
+# TTL per timeframe
+HTF_TTL_1H = 3600      # 1 jam
+HTF_TTL_15M = 900      # 15 menit
+
+# Struktur cache:
+# _htf_cache = {
+#   "BTCUSDT": {
+#       "1h":  {"ts":..., "hlc": {...}},
+#       "15m": {"ts":..., "hlc": {...}},
+#   },
+# }
+_htf_cache: Dict[str, Dict[str, Dict[str, object]]] = {}
 
 
 def _fetch_klines(symbol: str, interval: str, limit: int = 150) -> Optional[List[dict]]:
@@ -130,23 +139,58 @@ def _discount_premium(
     }
 
 
+def _get_hlc_cached(
+    symbol_u: str,
+    interval: str,
+    limit: int,
+    ttl: int,
+) -> Optional[Dict[str, np.ndarray]]:
+    """
+    Ambil HLC (high/low/close) dari cache jika belum kadaluarsa,
+    kalau sudah expired → fetch dari REST + update cache.
+    """
+    now = time.time()
+    sym_cache = _htf_cache.get(symbol_u)
+    tf_cache = sym_cache.get(interval) if sym_cache else None
+
+    if tf_cache:
+        ts = float(tf_cache.get("ts", 0.0))
+        hlc = tf_cache.get("hlc")
+        if hlc is not None and (now - ts) < ttl:
+            return hlc  # pakai data cached
+
+    # butuh fetch baru
+    data = _fetch_klines(symbol_u, interval, limit)
+    if not data:
+        # gagal fetch → jangan overwrite cache hlc lama,
+        # supaya masih bisa pakai data sebelumnya (kalau ada)
+        if tf_cache and "hlc" in tf_cache:
+            return tf_cache["hlc"]
+        return None
+
+    hlc = _parse_ohlc(data)
+
+    if sym_cache is None:
+        sym_cache = {}
+        _htf_cache[symbol_u] = sym_cache
+
+    sym_cache[interval] = {
+        "ts": now,
+        "hlc": hlc,
+    }
+
+    return hlc
+
+
 def get_htf_context(symbol: str) -> Dict[str, object]:
     """
     Ambil konteks 1h & 15m untuk symbol (tanpa indikator klasik),
-    dengan caching per symbol supaya tidak spam REST.
+    dengan caching terpisah:
+    - 1h: refresh setiap HTF_TTL_1H
+    - 15m: refresh setiap HTF_TTL_15M
     """
     symbol_u = symbol.upper()
-    now = time.time()
 
-    # Cek cache dulu
-    cached = _htf_cache.get(symbol_u)
-    if cached:
-        ts = cached.get("ts", 0.0)
-        ctx_cached = cached.get("ctx")
-        if ctx_cached is not None and (now - ts) < HTF_CACHE_TTL:
-            return ctx_cached  # langsung pakai cached context
-
-    # Default context (NETRAL)
     ctx_default = {
         "trend_1h": "RANGE",
         "pos_1h": "MID",
@@ -155,16 +199,11 @@ def get_htf_context(symbol: str) -> Dict[str, object]:
         "htf_ok_short": True,
     }
 
-    data_1h = _fetch_klines(symbol_u, "1h", 150)
-    data_15m = _fetch_klines(symbol_u, "15m", 150)
+    hlc_1h = _get_hlc_cached(symbol_u, "1h", 150, HTF_TTL_1H)
+    hlc_15m = _get_hlc_cached(symbol_u, "15m", 150, HTF_TTL_15M)
 
-    if not data_1h or not data_15m:
-        # Cache juga default supaya tidak spam request saat error
-        _htf_cache[symbol_u] = {"ts": now, "ctx": ctx_default}
+    if hlc_1h is None or hlc_15m is None:
         return ctx_default
-
-    hlc_1h = _parse_ohlc(data_1h)
-    hlc_15m = _parse_ohlc(data_15m)
 
     trend_1h = _detect_trend_1h(hlc_1h)
     pos1 = _discount_premium(hlc_1h)
@@ -184,14 +223,10 @@ def get_htf_context(symbol: str) -> Dict[str, object]:
     if pos_1h == "DISCOUNT" and pos_15m == "DISCOUNT":
         htf_ok_short = False
 
-    ctx_final = {
+    return {
         "trend_1h": trend_1h,
         "pos_1h": pos_1h,
         "pos_15m": pos_15m,
         "htf_ok_long": htf_ok_long,
         "htf_ok_short": htf_ok_short,
     }
-
-    # Simpan ke cache
-    _htf_cache[symbol_u] = {"ts": now, "ctx": ctx_final}
-    return ctx_final
