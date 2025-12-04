@@ -122,7 +122,7 @@ async def run_imb_bot():
                     if not kline:
                         continue
 
-                    symbol = kline.get("s", "").upper()
+                    symbol = data.get("data", {}).get("s", "").lower()
                     if not symbol:
                         continue
 
@@ -159,7 +159,8 @@ async def run_imb_bot():
                         continue
 
                     text = result["message"]
-                    broadcast_signal(text)
+                    # jalankan broadcast di thread terpisah agar loop WS tidak ke-block
+                    await asyncio.to_thread(broadcast_signal, text)
 
                     state.last_signal_time[symbol] = now_ts
                     print(
