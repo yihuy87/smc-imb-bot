@@ -40,3 +40,6 @@ IMB_MAX_ENTRY_AGE_CANDLES = int(os.getenv("IMB_MAX_ENTRY_AGE_CANDLES", "8"))
 
 # Minimal RR ke TP2 (misal 1.8 berarti TP2 minimal 1:1.8)
 IMB_MIN_RR_TP2 = float(os.getenv("IMB_MIN_RR_TP2", "1.8"))
+
+# Strict mode IMB
+IMB_STRICT_MODE = os.getenv("IMB_STRICT_MODE", "false").lower() == "true"
