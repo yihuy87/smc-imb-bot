@@ -208,6 +208,37 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     else:
         htf_alignment = bool(htf_ctx.get("htf_ok_short", True))
 
+    # === STRICT MODE FILTER ===
+    if imb_settings.strict_mode:
+        # impuls harus jauh lebih kuat dari rata2 body
+        avg_body = _avg_body(candles_5m)
+        imp_candle = candles_5m[imp_idx]
+        imp_body = abs(imp_candle["close"] - imp_candle["open"])
+        if imp_body < 2.5 * avg_body:
+            return None
+
+        # SL% lebih ketat
+        if not (0.20 <= sl_pct <= 0.80):
+            return None
+
+        # RR TP2 minimal 2.0R
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return None
+        rr_tp2_value = abs(tp2 - entry) / risk
+        if rr_tp2_value < 2.0:
+            return None
+
+        # HTF Wajib sinkron
+        if not htf_alignment:
+            return None
+
+        # entry tidak boleh terlalu jauh dari harga sekarang (>0.30%)
+        last_price = candles_5m[-1]["close"]
+        distance_pct = abs((entry - last_price) / last_price) * 100
+        if distance_pct > 0.30:
+            return None
+
     # meta untuk skoring
     meta = {
         "has_block": True,
