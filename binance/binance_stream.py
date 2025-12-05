@@ -80,16 +80,20 @@ async def run_imb_bot():
                 sem = asyncio.Semaphore(MAX_PRELOAD_CONCURRENCY)
 
                 async def _preload_one(sym: str):
+                    # sym di sini LOWERCASE, sama dengan yang dipakai WebSocket
                     async with sem:
                         try:
+                            # _fetch_klines sendiri akan .upper() di dalam
                             kl = await asyncio.to_thread(
-                                _fetch_klines, sym.upper(), "5m", PRELOAD_LIMIT_5M
+                                _fetch_klines, sym, "5m", PRELOAD_LIMIT_5M
                             )
-                            ohlc_mgr.preload_candles(sym.upper(), kl)
+                            if not kl:
+                                print(f"[PRELOAD] {sym} — klines kosong")
+                                return
+                            ohlc_mgr.preload_candles(sym, kl)
                         except Exception as e:
-                            print(f"[{sym}] Gagal preload 5m:", e)
+                            print(f"[PRELOAD ERROR] {sym}: {e}")
 
-                # jalankan preload semua symbol secara paralel (dengan batas concurrency)
                 await asyncio.gather(*(_preload_one(sym) for sym in symbols))
 
                 print("Preload selesai.")
@@ -142,7 +146,7 @@ async def run_imb_bot():
                     if not symbol:
                         continue
 
-                    # update buffer
+                    # update buffer (key: lowercase symbol)
                     ohlc_mgr.update_from_kline(symbol, kline)
                     candle_closed = bool(kline.get("x", False))
 
