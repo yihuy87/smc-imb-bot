@@ -413,3 +413,24 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
         "htf_context": htf_ctx,
         "message": text,
     }
+
+def _dynamic_tp_factors(
+    candles: List[Candle],
+    impulse_idx: int,
+    block_low: float,
+    block_high: float,
+    min_factor: float = 1.2,
+    max_factor: float = 3.5,
+) -> float:
+    imp = candles[impulse_idx]
+    impulse_strength = abs(imp["close"] - imp["open"])
+
+    block_range = abs(block_high - block_low)
+
+    sub = candles[-20:]
+    bodies = [abs(c["close"] - c["open"]) for c in sub]
+    vol = sum(bodies) / len(bodies) if bodies else impulse_strength
+
+    tp_factor = 1.0 + (impulse_strength / max(vol, 1e-9)) + (block_range / max(vol, 1e-9))
+
+    return max(min_factor, min(tp_factor, max_factor))
