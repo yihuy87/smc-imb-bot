@@ -4,7 +4,7 @@
 import asyncio
 import json
 import time
-from typing import Dict, List
+from typing import List
 
 import requests
 import websockets
@@ -25,7 +25,8 @@ from telegram.telegram_broadcast import broadcast_signal
 
 MAX_5M_CANDLES = 120
 PRELOAD_LIMIT_5M = 60
-# Batas berapa banyak request preload 5m yang paralel sekaligus
+
+# Batas preload REST /klines paralel (boleh dibesarkan kalau koneksi kuat)
 MAX_PRELOAD_CONCURRENCY = 20
 
 
@@ -35,6 +36,43 @@ def _fetch_klines(symbol: str, interval: str, limit: int) -> List[list]:
     r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
     return r.json()
+
+
+async def _analyze_and_broadcast(symbol: str, candles, now_ts: float):
+    """
+    Worker untuk:
+    - analisa IMB (sync, dijalankan di thread via asyncio.to_thread)
+    - jika ada sinyal: kirim Telegram (juga di thread)
+    - update cooldown dan log.
+
+    TIDAK dibatasi concurrency di level fungsi ini.
+    """
+    try:
+        # analisa IMB di thread terpisah
+        result = await asyncio.to_thread(analyze_symbol_imb, symbol, candles)
+    except Exception as e:
+        print(f"[{symbol}] ERROR analyze_symbol_imb:", e)
+        return
+
+    if not result:
+        return
+
+    text = result["message"]
+
+    try:
+        # kirim Telegram di thread terpisah
+        await asyncio.to_thread(broadcast_signal, text)
+    except Exception as e:
+        print(f"[{symbol}] ERROR broadcast_signal:", e)
+
+    # update cooldown timestamp
+    state.last_signal_time[symbol] = now_ts
+
+    print(
+        f"[{symbol}] IMB SINYAL TERKIRIM — "
+        f"Tier {result['tier']} (Score {result['score']}) "
+        f"Entry {result['entry']:.6f} SL {result['sl']:.6f}"
+    )
 
 
 async def run_imb_bot():
@@ -77,13 +115,13 @@ async def run_imb_bot():
                     f"(limit={PRELOAD_LIMIT_5M}, concurrency={MAX_PRELOAD_CONCURRENCY})..."
                 )
 
-                sem = asyncio.Semaphore(MAX_PRELOAD_CONCURRENCY)
+                sem_preload = asyncio.Semaphore(MAX_PRELOAD_CONCURRENCY)
 
                 async def _preload_one(sym: str):
-                    # sym di sini LOWERCASE, sama dengan yang dipakai WebSocket
-                    async with sem:
+                    # sym: lowercase symbol (sesuai dengan yang dipakai WS & OHLCBufferManager)
+                    async with sem_preload:
                         try:
-                            # _fetch_klines sendiri akan .upper() di dalam
+                            # _fetch_klines akan .upper() sendiri di dalam
                             kl = await asyncio.to_thread(
                                 _fetch_klines, sym, "5m", PRELOAD_LIMIT_5M
                             )
@@ -146,7 +184,7 @@ async def run_imb_bot():
                     if not symbol:
                         continue
 
-                    # update buffer (key: lowercase symbol)
+                    # update buffer
                     ohlc_mgr.update_from_kline(symbol, kline)
                     candle_closed = bool(kline.get("x", False))
 
@@ -164,6 +202,7 @@ async def run_imb_bot():
                         continue
 
                     now_ts = time.time()
+                    # cooldown tetap dicek DI SINI sebelum lempar task
                     if state.cooldown_seconds > 0:
                         last_ts = state.last_signal_time.get(symbol)
                         if last_ts and now_ts - last_ts < state.cooldown_seconds:
@@ -174,19 +213,10 @@ async def run_imb_bot():
                                 )
                             continue
 
-                    result = analyze_symbol_imb(symbol, candles)
-                    if not result:
-                        continue
-
-                    text = result["message"]
-                    # Jalankan broadcast di thread terpisah agar loop WebSocket tidak ke-block.
-                    await asyncio.to_thread(broadcast_signal, text)
-
-                    state.last_signal_time[symbol] = now_ts
-                    print(
-                        f"[{symbol}] IMB sinyal dikirim: "
-                        f"Tier {result['tier']} (Score {result['score']}) "
-                        f"Entry {result['entry']:.6f} SL {result['sl']:.6f}"
+                    # === PENTING: analisa & kirim sinyal DIJALANKAN DI TASK TERPISAH ===
+                    # supaya loop WebSocket tidak pernah ke-block oleh kerja berat.
+                    asyncio.create_task(
+                        _analyze_and_broadcast(symbol, list(candles), now_ts)
                     )
 
         except websockets.ConnectionClosed:
