@@ -145,20 +145,37 @@ def _build_levels(
     rr2: float = 2.0,
     rr3: float = 3.0,
 ) -> Dict[str, float]:
+    """
+    Bangun Entry / SL / TP berdasarkan blok.
+
+    Aturan utama:
+    - LONG  : Entry di block_low, SL DI BAWAH block_low
+    - SHORT : Entry di block_high, SL DI ATAS block_high
+    """
+
     if side == "long":
-        raw_entry = block_low
-        entry = min(raw_entry, last_price)
+        # Entry di area blok (limit nunggu harga balik ke block_low)
+        entry = block_low
+        # SL sedikit di bawah blok
         sl = block_low * 0.997
         risk = entry - sl
-    else:
-        raw_entry = block_high
-        entry = max(raw_entry, last_price)
+
+    else:  # side == "short"
+        # Entry di area blok (limit di block_high)
+        entry = block_high
+        # SL sedikit di atas blok
         sl = block_high * 1.003
         risk = sl - entry
 
+    # Safety fallback kalau ada kasus aneh
     if risk <= 0:
         risk = abs(entry) * 0.003
+        if side == "long":
+            sl = entry - risk
+        else:
+            sl = entry + risk
 
+    # Hitung TP berdasarkan RR
     if side == "long":
         tp1 = entry + rr1 * risk
         tp2 = entry + rr2 * risk
