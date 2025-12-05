@@ -30,11 +30,10 @@ def _candle_arrays(candles: List[Candle]):
     return opens, highs, lows, closes
 
 
-# ==============================
-# Optimized function: _avg_body
-# ==============================
-
 def _avg_body(candles: List[Candle], lookback: int = 30) -> float:
+    """
+    Rata-rata body |close-open|, pakai NumPy.
+    """
     if not candles:
         return 0.0
 
@@ -42,7 +41,6 @@ def _avg_body(candles: List[Candle], lookback: int = 30) -> float:
     if opens is None or closes is None or opens.size == 0:
         return 0.0
 
-    # Tail sesuai lookback
     if lookback and opens.size > lookback:
         opens = opens[-lookback:]
         closes = closes[-lookback:]
@@ -51,14 +49,10 @@ def _avg_body(candles: List[Candle], lookback: int = 30) -> float:
     return float(bodies.mean()) if bodies.size > 0 else 0.0
 
 
-# ==============================
-# Optimized function: _find_impulse
-# ==============================
-
 def _find_impulse(candles: List[Candle]) -> Optional[int]:
     """
     Cari candle impuls terakhir (body > factor * rata2 body).
-    NumPy-accelerated version.
+    Versi NumPy.
     """
     n = len(candles)
     if n < 20:
@@ -68,7 +62,7 @@ def _find_impulse(candles: List[Candle]) -> Optional[int]:
     if avg <= 0:
         return None
 
-    factor = 1.8
+    factor = 1.8  # threshold awal; nanti kita ketatkan lagi di analyze_symbol_imb
 
     opens, _, _, closes = _candle_arrays(candles)
     if opens is None or closes is None:
@@ -76,7 +70,6 @@ def _find_impulse(candles: List[Candle]) -> Optional[int]:
 
     bodies = np.abs(closes - opens)
 
-    # fokus di ~20 candle terakhir
     start = max(0, n - 20)
     tail = bodies[start:]
 
@@ -89,10 +82,6 @@ def _find_impulse(candles: List[Candle]) -> Optional[int]:
     best_idx = int(idx_candidates[best_local])
     return best_idx
 
-
-# ====================================
-# ORIGINAL — tetap, tidak dioptimasi
-# ====================================
 
 def _find_block(candles: List[Candle], impulse_idx: int) -> Optional[Tuple[float, float, str]]:
     """
@@ -152,19 +141,13 @@ def _build_levels(
     - LONG  : Entry di block_low, SL DI BAWAH block_low
     - SHORT : Entry di block_high, SL DI ATAS block_high
     """
-
     if side == "long":
-        # Entry di area blok (limit nunggu harga balik ke block_low)
         entry = block_low
-        # SL sedikit di bawah blok
-        sl = block_low * 0.997
+        sl = block_low * 0.997  # ~0.3% di bawah blok
         risk = entry - sl
-
-    else:  # side == "short"
-        # Entry di area blok (limit di block_high)
+    else:
         entry = block_high
-        # SL sedikit di atas blok
-        sl = block_high * 1.003
+        sl = block_high * 1.003  # ~0.3% di atas blok
         risk = sl - entry
 
     # Safety fallback kalau ada kasus aneh
@@ -175,7 +158,6 @@ def _build_levels(
         else:
             sl = entry + risk
 
-    # Hitung TP berdasarkan RR
     if side == "long":
         tp1 = entry + rr1 * risk
         tp2 = entry + rr2 * risk
@@ -201,8 +183,13 @@ def _build_levels(
 
 
 def recommend_leverage_range(sl_pct: float) -> Tuple[float, float]:
+    """
+    Rekomendasi leverage rentang berdasarkan SL% (risk per posisi jika 1x).
+    Sama gaya dengan bot pertama.
+    """
     if sl_pct <= 0:
         return 5.0, 10.0
+
     if sl_pct <= 0.25:
         return 25.0, 40.0
     elif sl_pct <= 0.50:
@@ -216,6 +203,16 @@ def recommend_leverage_range(sl_pct: float) -> Tuple[float, float]:
 
 
 def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
+    """
+    Analisa IMB untuk satu symbol menggunakan data 5m.
+    Flow:
+    - cari impuls kuat terakhir
+    - temukan blok IMB sebelum impuls
+    - bangun Entry/SL/TP berdasarkan blok
+    - cek RR & SL%
+    - cek konteks HTF
+    - skor & tier → hanya kirim jika >= min_tier
+    """
     if len(candles_5m) < 40:
         return None
 
@@ -239,47 +236,51 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     tp3 = levels["tp3"]
     sl_pct = levels["sl_pct"]
 
+    # ---------- FILTER KETAT DASAR (ANTI SPAM) ----------
+
+    # 1) impuls harus benar-benar kuat: body >= 2.2x rata-rata
+    avg_body = _avg_body(candles_5m)
+    imp_candle = candles_5m[imp_idx]
+    imp_body = abs(imp_candle["close"] - imp_candle["open"])
+    if avg_body <= 0 or imp_body < 2.2 * avg_body:
+        return None
+
+    # 2) SL% harus di range yang masuk akal (0.25% s/d 0.8%)
+    if not (0.25 <= sl_pct <= 0.80):
+        return None
+
+    # 3) RR minimal: TP2 >= 2.0R
     risk = abs(entry - sl)
     if risk <= 0:
         return None
-
     rr_tp2 = abs(tp2 - entry) / risk
-    rr_ok = rr_tp2 >= 1.8
+    if rr_tp2 < 2.0:
+        return None
 
+    # 4) HTF wajib searah, tidak boleh netral / melawan
     htf_ctx = get_htf_context(symbol)
     if side == "long":
         htf_alignment = bool(htf_ctx.get("htf_ok_long", True))
     else:
         htf_alignment = bool(htf_ctx.get("htf_ok_short", True))
 
-    if imb_settings.strict_mode:
-        avg_body = _avg_body(candles_5m)
-        imp_candle = candles_5m[imp_idx]
-        imp_body = abs(imp_candle["close"] - imp_candle["open"])
-        if imp_body < 2.5 * avg_body:
-            return None
+    if not htf_alignment:
+        return None
 
-        if not (0.20 <= sl_pct <= 0.80):
-            return None
+    # 5) Entry tidak boleh terlalu jauh dari harga sekarang (>0.35%)
+    distance_pct = abs((entry - last_price) / last_price) * 100 if last_price else 999
+    if distance_pct > 0.35:
+        return None
 
-        rr_tp2_value = abs(tp2 - entry) / abs(entry - sl)
-        if rr_tp2_value < 2.0:
-            return None
+    # ---------- META & SCORING ----------
 
-        if not htf_alignment:
-            return None
-
-        last_price = candles_5m[-1]["close"]
-        distance_pct = abs((entry - last_price) / last_price) * 100
-        if distance_pct > 0.30:
-            return None
-
+    # rr_ok sudah pasti True karena kita paksa rr_tp2 >= 2.0
     meta = {
         "has_block": True,
         "impulse_ok": True,
         "touch_ok": True,
         "reaction_ok": True,
-        "rr_ok": rr_ok,
+        "rr_ok": True,
         "sl_pct": sl_pct,
         "htf_alignment": htf_alignment,
     }
@@ -303,6 +304,7 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     approx_minutes = max_age_candles * 5
     valid_text = f"±{approx_minutes} menit" if approx_minutes > 0 else "singkat"
 
+    # Risk calculator mini
     if sl_pct > 0:
         pos_mult = 100.0 / sl_pct
         example_balance = 100.0
