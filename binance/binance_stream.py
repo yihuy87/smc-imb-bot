@@ -25,6 +25,8 @@ from telegram.telegram_broadcast import broadcast_signal
 
 MAX_5M_CANDLES = 120
 PRELOAD_LIMIT_5M = 60
+# Batas berapa banyak request preload 5m yang paralel sekaligus
+MAX_PRELOAD_CONCURRENCY = 20
 
 
 def _fetch_klines(symbol: str, interval: str, limit: int) -> List[list]:
@@ -67,15 +69,29 @@ async def run_imb_bot():
                 state.force_pairs_refresh = False
                 print(f"Scan {len(symbols)} pair:", ", ".join(s.upper() for s in symbols))
 
-                # preload 60 candle 5m untuk tiap symbol
-                print(f"Mulai preload history 5m untuk {len(symbols)} symbol (limit={PRELOAD_LIMIT_5M})...")
-                for sym in symbols:
-                    try:
-                        kl = _fetch_klines(sym.upper(), "5m", PRELOAD_LIMIT_5M)
-                        ohlc_mgr.preload_candles(sym.upper(), kl)
-                    except Exception as e:
-                        print(f"[{sym}] Gagal preload 5m:", e)
-                        continue
+                # ============================
+                # PRELOAD HISTORY 5M (PARALEL)
+                # ============================
+                print(
+                    f"Mulai preload history 5m untuk {len(symbols)} symbol "
+                    f"(limit={PRELOAD_LIMIT_5M}, concurrency={MAX_PRELOAD_CONCURRENCY})..."
+                )
+
+                sem = asyncio.Semaphore(MAX_PRELOAD_CONCURRENCY)
+
+                async def _preload_one(sym: str):
+                    async with sem:
+                        try:
+                            kl = await asyncio.to_thread(
+                                _fetch_klines, sym.upper(), "5m", PRELOAD_LIMIT_5M
+                            )
+                            ohlc_mgr.preload_candles(sym.upper(), kl)
+                        except Exception as e:
+                            print(f"[{sym}] Gagal preload 5m:", e)
+
+                # jalankan preload semua symbol secara paralel (dengan batas concurrency)
+                await asyncio.gather(*(_preload_one(sym) for sym in symbols))
+
                 print("Preload selesai.")
 
             if not symbols:
@@ -159,7 +175,7 @@ async def run_imb_bot():
                         continue
 
                     text = result["message"]
-                    # jalankan broadcast di thread terpisah agar loop WS tidak ke-block
+                    # Jalankan broadcast di thread terpisah agar loop WebSocket tidak ke-block.
                     await asyncio.to_thread(broadcast_signal, text)
 
                     state.last_signal_time[symbol] = now_ts
