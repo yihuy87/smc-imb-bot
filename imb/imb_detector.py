@@ -1,5 +1,6 @@
 # imb/imb_detector.py
 # Deteksi setup IMB (Institutional Mitigation Block) + bangun Entry/SL/TP.
+# Versi STRICT / profesional (opsi A): jauh lebih sedikit sinyal.
 
 from typing import Dict, List, Optional, Tuple
 import numpy as np
@@ -49,31 +50,33 @@ def _avg_body(candles: List[Candle], lookback: int = 30) -> float:
     return float(bodies.mean()) if bodies.size > 0 else 0.0
 
 
-def _find_impulse(candles: List[Candle]) -> Optional[int]:
+# ==============================
+# IMB building blocks
+# ==============================
+
+def _find_impulse(
+    opens: np.ndarray,
+    closes: np.ndarray,
+    avg_body: float,
+    lookback_tail: int = 20,
+    factor: float = 2.5,
+) -> Optional[int]:
     """
-    Cari candle impuls terakhir (body > factor * rata2 body).
-    Versi NumPy.
+    Cari candle impuls terakhir:
+    - body >= factor * avg_body (STRICT)
+    - fokus di lookback_tail candle terakhir.
+    Return index candle impuls atau None.
     """
-    n = len(candles)
-    if n < 20:
-        return None
-
-    avg = _avg_body(candles, lookback=30)
-    if avg <= 0:
-        return None
-
-    factor = 1.8  # threshold awal; nanti kita ketatkan lagi di analyze_symbol_imb
-
-    opens, _, _, closes = _candle_arrays(candles)
-    if opens is None or closes is None:
+    n = opens.size
+    if n < 20 or avg_body <= 0:
         return None
 
     bodies = np.abs(closes - opens)
 
-    start = max(0, n - 20)
+    start = max(0, n - lookback_tail)
     tail = bodies[start:]
 
-    mask = tail > (factor * avg)
+    mask = tail >= (factor * avg_body)
     if not mask.any():
         return None
 
@@ -83,46 +86,111 @@ def _find_impulse(candles: List[Candle]) -> Optional[int]:
     return best_idx
 
 
-def _find_block(candles: List[Candle], impulse_idx: int) -> Optional[Tuple[float, float, str]]:
+def _find_block_and_filters(
+    candles: List[Candle],
+    opens: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    imp_idx: int,
+    avg_body: float,
+) -> Optional[Tuple[float, float, str, bool, bool]]:
     """
-    Temukan blok IMB sederhana:
-    - untuk impuls naik → blok adalah range dari 1–3 candle bearish sebelum impuls
-    - untuk impuls turun → blok adalah range dari 1–3 candle bullish sebelum impuls
-    Return (block_low, block_high, side) atau None.
+    Temukan blok IMB + filter ketat:
+    - blok = 1–3 candle berlawanan sebelum impuls
+    - candle blok harus punya body >= 0.75 * avg_body (bukan candle kecil)
+    - wajib ada FVG kuat antara blok dan impuls
+    - impuls harus break structure (BOS) signifikan.
+
+    Return:
+      (block_low, block_high, side, has_fvg, bos_ok)
+    atau None kalau tidak valid.
     """
-    if impulse_idx is None or impulse_idx <= 0:
+    if imp_idx is None or imp_idx <= 0:
         return None
 
-    imp = candles[impulse_idx]
-    side = "long" if imp["close"] > imp["open"] else "short"
+    imp_open = opens[imp_idx]
+    imp_close = closes[imp_idx]
+    side = "long" if imp_close > imp_open else "short"
 
-    start = max(0, impulse_idx - 3)
-    end = impulse_idx
+    n = opens.size
 
-    highs: List[float] = []
-    lows: List[float] = []
+    # ---- cari blok: 1–3 candle sebelum impuls, warna berlawanan & body besar ----
+    start = max(0, imp_idx - 3)
+    end = imp_idx
+
+    block_highs: List[float] = []
+    block_lows: List[float] = []
+
+    min_block_body = 0.75 * avg_body  # STRICT: minimal cukup besar
 
     for i in range(start, end):
-        c = candles[i]
-        if side == "long":
-            if c["close"] < c["open"]:
-                highs.append(c["high"])
-                lows.append(c["low"])
-        else:
-            if c["close"] > c["open"]:
-                highs.append(c["high"])
-                lows.append(c["low"])
+        o = opens[i]
+        c = closes[i]
+        body = abs(c - o)
 
-    if not highs or not lows:
+        if body < min_block_body:
+            continue  # candle kecil → bukan blok IMB
+
+        if side == "long":
+            # butuh candle merah besar sebelum impuls hijau
+            if c < o:
+                block_highs.append(highs[i])
+                block_lows.append(lows[i])
+        else:
+            # side short → candle hijau besar sebelum impuls merah
+            if c > o:
+                block_highs.append(highs[i])
+                block_lows.append(lows[i])
+
+    if not block_highs or not block_lows:
         return None
 
-    block_high = max(highs)
-    block_low = min(lows)
+    block_high = max(block_highs)
+    block_low = min(block_lows)
 
     if block_high <= block_low:
         return None
 
-    return block_low, block_high, side
+    # ---- check FVG kuat antara blok dan impuls ----
+    # Definisi sederhana & ketat:
+    # LONG : seluruh candle impuls berada di atas block_high → ada gap dari block ke impuls.
+    # SHORT: seluruh candle impuls berada di bawah block_low.
+    imp_high = highs[imp_idx]
+    imp_low = lows[imp_idx]
+
+    if side == "long":
+        has_fvg = imp_low > block_high
+    else:
+        has_fvg = imp_high < block_low
+
+    if not has_fvg:
+        # tanpa FVG jelas → kita anggap bukan IMB setup
+        return None
+
+    # ---- BOS (Break of Structure) ----
+    # LONG: imp_high harus > high tertinggi 10 candle sebelum blok.
+    # SHORT: imp_low harus < low terendah 10 candle sebelum blok.
+    pre_start = max(0, start - 10)
+    pre_end = start  # sampai sebelum blok
+
+    if pre_end <= pre_start:
+        return None
+
+    pre_highs = highs[pre_start:pre_end]
+    pre_lows = lows[pre_start:pre_end]
+
+    if side == "long":
+        prev_struct_high = float(pre_highs.max())
+        bos_ok = imp_high > prev_struct_high * 1.001  # at least ~0.1% break
+    else:
+        prev_struct_low = float(pre_lows.min())
+        bos_ok = imp_low < prev_struct_low * 0.999  # at least ~0.1% break
+
+    if not bos_ok:
+        return None
+
+    return block_low, block_high, side, True, True
 
 
 def _build_levels(
@@ -131,13 +199,12 @@ def _build_levels(
     block_high: float,
     last_price: float,
     rr1: float = 1.2,
-    rr2: float = 2.0,
+    rr2: float = 2.2,
     rr3: float = 3.0,
 ) -> Dict[str, float]:
     """
-    Bangun Entry / SL / TP berdasarkan blok.
+    Bangun Entry / SL / TP berdasarkan blok (STRICT):
 
-    Aturan utama:
     - LONG  : Entry di block_low, SL DI BAWAH block_low
     - SHORT : Entry di block_high, SL DI ATAS block_high
     """
@@ -185,7 +252,6 @@ def _build_levels(
 def recommend_leverage_range(sl_pct: float) -> Tuple[float, float]:
     """
     Rekomendasi leverage rentang berdasarkan SL% (risk per posisi jika 1x).
-    Sama gaya dengan bot pertama.
     """
     if sl_pct <= 0:
         return 5.0, 10.0
@@ -202,29 +268,36 @@ def recommend_leverage_range(sl_pct: float) -> Tuple[float, float]:
         return 3.0, 5.0
 
 
+# ==============================
+# Main analyzer
+# ==============================
+
 def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     """
-    Analisa IMB untuk satu symbol menggunakan data 5m.
-    Flow:
-    - cari impuls kuat terakhir
-    - temukan blok IMB sebelum impuls
-    - bangun Entry/SL/TP berdasarkan blok
-    - cek RR & SL%
-    - cek konteks HTF
-    - skor & tier → hanya kirim jika >= min_tier
+    Analisa IMB untuk satu symbol menggunakan data 5m (STRICT mode).
     """
     if len(candles_5m) < 40:
         return None
 
-    imp_idx = _find_impulse(candles_5m)
+    opens, highs, lows, closes = _candle_arrays(candles_5m)
+    if opens is None or highs is None or lows is None or closes is None:
+        return None
+
+    avg_body = _avg_body(candles_5m)
+    if avg_body <= 0:
+        return None
+
+    imp_idx = _find_impulse(opens, closes, avg_body, lookback_tail=25, factor=2.5)
     if imp_idx is None:
         return None
 
-    block = _find_block(candles_5m, imp_idx)
-    if not block:
+    block_info = _find_block_and_filters(
+        candles_5m, opens, highs, lows, closes, imp_idx, avg_body
+    )
+    if not block_info:
         return None
 
-    block_low, block_high, side = block
+    block_low, block_high, side, has_fvg, bos_ok = block_info
     last_price = candles_5m[-1]["close"]
 
     levels = _build_levels(side, block_low, block_high, last_price)
@@ -236,28 +309,21 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     tp3 = levels["tp3"]
     sl_pct = levels["sl_pct"]
 
-    # ---------- FILTER KETAT DASAR (ANTI SPAM) ----------
+    # ---------- FILTER KETAT LANJUTAN (ANTI SPAM) ----------
 
-    # 1) impuls harus benar-benar kuat: body >= 2.2x rata-rata
-    avg_body = _avg_body(candles_5m)
-    imp_candle = candles_5m[imp_idx]
-    imp_body = abs(imp_candle["close"] - imp_candle["open"])
-    if avg_body <= 0 or imp_body < 2.2 * avg_body:
-        return None
-
-    # 2) SL% harus di range yang masuk akal (0.25% s/d 0.8%)
+    # 1) SL% harus di range yang ketat (0.25% s/d 0.80%)
     if not (0.25 <= sl_pct <= 0.80):
         return None
 
-    # 3) RR minimal: TP2 >= 2.0R
+    # 2) RR minimal: TP2 >= 2.2R
     risk = abs(entry - sl)
     if risk <= 0:
         return None
     rr_tp2 = abs(tp2 - entry) / risk
-    if rr_tp2 < 2.0:
+    if rr_tp2 < 2.2:
         return None
 
-    # 4) HTF wajib searah, tidak boleh netral / melawan
+    # 3) HTF wajib searah
     htf_ctx = get_htf_context(symbol)
     if side == "long":
         htf_alignment = bool(htf_ctx.get("htf_ok_long", True))
@@ -267,20 +333,19 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
     if not htf_alignment:
         return None
 
-    # 5) Entry tidak boleh terlalu jauh dari harga sekarang (>0.35%)
+    # 4) Entry tidak boleh terlalu jauh dari harga sekarang (>0.35%)
     distance_pct = abs((entry - last_price) / last_price) * 100 if last_price else 999
     if distance_pct > 0.35:
         return None
 
     # ---------- META & SCORING ----------
 
-    # rr_ok sudah pasti True karena kita paksa rr_tp2 >= 2.0
     meta = {
         "has_block": True,
         "impulse_ok": True,
-        "touch_ok": True,
-        "reaction_ok": True,
-        "rr_ok": True,
+        "touch_ok": has_fvg,       # kita pakai FVG sebagai validasi touch
+        "reaction_ok": bos_ok,     # BOS sebagai proxy reaction kuat
+        "rr_ok": True,             # sudah dipaksa RR >= 2.2
         "sl_pct": sl_pct,
         "htf_alignment": htf_alignment,
     }
@@ -325,7 +390,7 @@ def analyze_symbol_imb(symbol: str, candles_5m: List[Candle]) -> Optional[Dict]:
         f"TP1   : `{tp1:.6f}`\n"
         f"TP2   : `{tp2:.6f}`\n"
         f"TP3   : `{tp3:.6f}`\n"
-        f"Model : IMB Mitigation Block\n"
+        f"Model : IMB Mitigation Block (STRICT)\n"
         f"Rekomendasi Leverage : {lev_text} (SL {sl_pct_text})\n"
         f"Validitas Entry : {valid_text}\n"
         f"Tier : {tier} (Score {score})\n"
